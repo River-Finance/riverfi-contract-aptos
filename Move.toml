@@ -1,15 +1,26 @@
 [package]
 name = "riverfi"
 version = "1.0.0"
+upgrade_policy = "compatible"
 authors = []
 
 [addresses]
+riverfi = "_"
+deployer = "_"
+dex_contract = "_"
+usdc = "0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832"
 
 [dev-addresses]
+riverfi = "0xDEAD"
+deployer = "0xBB"
+dex_contract = "0xAA"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-framework.git"
 rev = "mainnet"
 subdir = "aptos-framework"
+[dependencies.dex]
+git = "https://github.com/Hyperfluid/hyperfluid-interface"
+rev = "main"
 
 [dev-dependencies]
