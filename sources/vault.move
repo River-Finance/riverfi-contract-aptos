@@ -3,6 +3,7 @@ module riverfi::vault {
     use std::error;
     use std::string;
     use std::option;
+    use std::vector;
     use aptos_framework::object::{Self, Object, ExtendRef};
     use aptos_framework::event;
     use aptos_framework::fungible_asset::{Self, Metadata, MintRef, TransferRef, BurnRef};
@@ -10,12 +11,18 @@ module riverfi::vault {
     use aptos_framework::timestamp::now_seconds;
 
     use riverfi::storage;
+    use riverfi::hyperion_strategy;
 
     // -- Constants
     const RUSDC_TOKEN_NAME: vector<u8> = b"River USDC";
     const RUSDC_TOKEN_SYMBOL: vector<u8> = b"RUSDC";
     const RUSDC_TOKEN_DECIMALS: u8 = 6;
     const VAULT_SEED: vector<u8> = b"vault::VAULT";
+
+    // Strategy allocation (DISABLED: 100% to reserves for basic testing)
+    const HYPERION_ALLOCATION_PERCENT: u64 = 0;   // Disabled until pool ready
+    const RESERVE_ALLOCATION_PERCENT: u64 = 100; // 100% instant liquidity
+    const APT_ADDRESS: address = @0x1; // APT token address
 
     // -- Errors
     const E_ALREADY_INITIALIZED: u64 = 1;
@@ -44,6 +51,8 @@ module riverfi::vault {
         total_rusdc_supply: u64,
         hyperion_usdc: u64,  // Amount deposited to Hyperion
         reserve_usdc: u64,   // Amount kept in vault for instant withdrawals
+        // Store Hyperion positions for tracking (stable pair strategy)
+        hyperion_positions: vector<Object<dex_contract::position_v3::Info>>,
     }
 
     // -- Events
@@ -109,12 +118,31 @@ module riverfi::vault {
         // 2. Mint RUSDC 1:1 to user
         mint_rusdc(user_addr, amount);
 
-        // 3. Update vault stats
+        // 3. Calculate allocation: 80% Hyperion, 20% Reserve
+        let hyperion_amount = (amount * HYPERION_ALLOCATION_PERCENT) / 100;
+        let reserve_amount = amount - hyperion_amount;
+
+        // 4. Deploy to Hyperion stable pair strategy (80% USDC → USDC/USDT LP) - ENABLED!
+        let vault_signer = get_vault_signer(vault);
+        if (hyperion_amount > 0) {
+            // Create USDC/USDT liquidity position via stable pair strategy
+            let position = hyperion_strategy::deposit_to_hyperion(
+                &vault_signer,
+                hyperion_amount,
+                usdc_metadata
+            );
+
+            // Track the position for future yield claiming and withdrawals
+            vector::push_back(&mut vault.hyperion_positions, position);
+            vault.hyperion_usdc = vault.hyperion_usdc + hyperion_amount;
+        };
+
+        // 5. Keep remainder in reserve (20%)
+        vault.reserve_usdc = vault.reserve_usdc + reserve_amount;
+
+        // 6. Update total stats
         vault.total_usdc = vault.total_usdc + amount;
         vault.total_rusdc_supply = vault.total_rusdc_supply + amount;
-
-        // For now, all goes to reserve (will add Hyperion integration later)
-        vault.reserve_usdc = vault.reserve_usdc + amount;
 
         // 4. Emit event
         event::emit(
@@ -208,6 +236,7 @@ module riverfi::vault {
             total_rusdc_supply: 0,
             hyperion_usdc: 0,
             reserve_usdc: 0,
+            hyperion_positions: vector::empty(),
         });
     }
 
