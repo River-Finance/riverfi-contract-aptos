@@ -11,6 +11,10 @@ module riverfi::vault {
     use aptos_framework::timestamp::now_seconds;
 
     use riverfi::storage;
+    use riverfi::tapp_exchange;
+    use riverfi::hyperion;
+    use riverfi::yield_math;
+    use riverfi::mock_usdc;
     use riverfi::hyperion_strategy;
 
     // -- Constants
@@ -19,9 +23,10 @@ module riverfi::vault {
     const RUSDC_TOKEN_DECIMALS: u8 = 6;
     const VAULT_SEED: vector<u8> = b"vault::VAULT";
 
-    // Strategy allocation (DISABLED: 100% to reserves for basic testing)
-    const HYPERION_ALLOCATION_PERCENT: u64 = 0;   // Disabled until pool ready
-    const RESERVE_ALLOCATION_PERCENT: u64 = 100; // 100% instant liquidity
+    // Mock Protocol allocation (50% Tapp, 30% Hyperion, 20% Reserve)
+    const DEFAULT_TAPP_ALLOCATION_PERCENT: u8 = 50;   // 50% to Tapp Exchange
+    const DEFAULT_HYPERION_ALLOCATION_PERCENT: u8 = 30; // 30% to Hyperion
+    const DEFAULT_RESERVE_ALLOCATION_PERCENT: u8 = 20; // 20% instant liquidity
     const APT_ADDRESS: address = @0x1; // APT token address
 
     // -- Errors
@@ -34,6 +39,13 @@ module riverfi::vault {
     struct Config has key {
         enable_deposit: bool,
         enable_withdraw: bool,
+    }
+
+    struct AllocationConfig has key {
+        tapp_percent: u8,
+        hyperion_percent: u8,
+        reserve_percent: u8,
+        last_rebalance_ts: u64,
     }
 
     struct RUSDCToken has key {
@@ -49,10 +61,19 @@ module riverfi::vault {
         extend_ref: ExtendRef,
         total_usdc: u64,
         total_rusdc_supply: u64,
-        hyperion_usdc: u64,  // Amount deposited to Hyperion
         reserve_usdc: u64,   // Amount kept in vault for instant withdrawals
-        // Store Hyperion positions for tracking (stable pair strategy)
-        hyperion_positions: vector<Object<dex_contract::position_v3::Info>>,
+        
+        // Mock Protocol Positions
+        tapp_shares: u128,      // Shares in Tapp Exchange
+        hyperion_lp_tokens: u128, // LP tokens in Hyperion
+        
+        // NAV tracking
+        exchange_rate: u128,    // USDC per RUSDC (scaled by 1e12)
+        last_harvest_ts: u64,   // Last time yields were harvested
+        
+        // Legacy Hyperion positions (for backward compatibility)
+        hyperion_positions: vector<Object<riverfi::hyperion_strategy::Info>>,
+        hyperion_usdc: u64,  // Amount deposited to real Hyperion
     }
 
     // -- Events
@@ -78,6 +99,36 @@ module riverfi::vault {
         timestamp: u64
     }
 
+    #[event]
+    struct AllocationUpdateEvent has drop, store {
+        old_tapp_percent: u8,
+        old_hyperion_percent: u8,
+        old_reserve_percent: u8,
+        new_tapp_percent: u8,
+        new_hyperion_percent: u8,
+        new_reserve_percent: u8,
+        admin: address,
+        timestamp: u64
+    }
+
+    #[event]
+    struct HarvestEvent has drop, store {
+        tapp_value: u128,
+        hyperion_value: u128,
+        total_nav: u128,
+        old_exchange_rate: u128,
+        new_exchange_rate: u128,
+        yield_earned: u128,
+        timestamp: u64
+    }
+
+    #[event]
+    struct ExchangeRateUpdateEvent has drop, store {
+        old_rate: u128,
+        new_rate: u128,
+        timestamp: u64
+    }
+
     // -- Init
     fun init_module(sender: &signer) {
         let addr = signer::address_of(sender);
@@ -97,11 +148,22 @@ module riverfi::vault {
             }
         );
 
+        // Initialize allocation config
+        move_to(
+            sender,
+            AllocationConfig {
+                tapp_percent: DEFAULT_TAPP_ALLOCATION_PERCENT,
+                hyperion_percent: DEFAULT_HYPERION_ALLOCATION_PERCENT,
+                reserve_percent: DEFAULT_RESERVE_ALLOCATION_PERCENT,
+                last_rebalance_ts: now_seconds(),
+            }
+        );
+
         init_rusdc_token(sender);
     }
 
     // -- Public Entry Functions
-    public entry fun deposit(sender: &signer, amount: u64) acquires Config, RUSDCToken, Vault {
+    public entry fun deposit(sender: &signer, amount: u64) acquires Config, RUSDCToken, Vault, AllocationConfig {
         assert!(amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
 
         let config = borrow_global<Config>(@riverfi);
@@ -109,53 +171,68 @@ module riverfi::vault {
 
         let user_addr = signer::address_of(sender);
         let vault_addr = get_vault_address();
+        
+        // Harvest existing yield before new deposit
+        harvest_yield_internal();
+        
         let vault = borrow_global_mut<Vault>(vault_addr);
 
         // 1. Transfer USDC from user to vault
-        let usdc_metadata = object::address_to_object<Metadata>(@usdc);
+        let usdc_metadata = mock_usdc::get_token();
         primary_fungible_store::transfer(sender, usdc_metadata, vault_addr, amount);
 
-        // 2. Mint RUSDC 1:1 to user
-        mint_rusdc(user_addr, amount);
+        // 2. Calculate allocation amounts
+        let allocation_config = borrow_global<AllocationConfig>(@riverfi);
+        let tapp_amount = (amount * (allocation_config.tapp_percent as u64)) / 100;
+        let hyperion_amount = (amount * (allocation_config.hyperion_percent as u64)) / 100;
+        let reserve_amount = amount - tapp_amount - hyperion_amount;
 
-        // 3. Calculate allocation: 80% Hyperion, 20% Reserve
-        let hyperion_amount = (amount * HYPERION_ALLOCATION_PERCENT) / 100;
-        let reserve_amount = amount - hyperion_amount;
-
-        // 4. Deploy to Hyperion stable pair strategy (80% USDC → USDC/USDT LP) - ENABLED!
+        // 3. Get vault signer for protocol deposits
         let vault_signer = get_vault_signer(vault);
-        if (hyperion_amount > 0) {
-            // Create USDC/USDT liquidity position via stable pair strategy
-            let position = hyperion_strategy::deposit_to_hyperion(
-                &vault_signer,
-                hyperion_amount,
-                usdc_metadata
-            );
 
-            // Track the position for future yield claiming and withdrawals
-            vector::push_back(&mut vault.hyperion_positions, position);
-            vault.hyperion_usdc = vault.hyperion_usdc + hyperion_amount;
+        // 4. Deploy to Tapp Exchange
+        if (tapp_amount > 0) {
+            let new_tapp_shares = tapp_exchange::vault_deposit(&vault_signer, tapp_amount);
+            vault.tapp_shares = vault.tapp_shares + new_tapp_shares;
         };
 
-        // 5. Keep remainder in reserve (20%)
+        // 5. Deploy to Hyperion mock protocol
+        if (hyperion_amount > 0) {
+            let new_lp_tokens = hyperion::vault_provide_liquidity(&vault_signer, hyperion_amount);
+            vault.hyperion_lp_tokens = vault.hyperion_lp_tokens + new_lp_tokens;
+        };
+
+        // 6. Keep remainder in reserve
         vault.reserve_usdc = vault.reserve_usdc + reserve_amount;
 
-        // 6. Update total stats
-        vault.total_usdc = vault.total_usdc + amount;
-        vault.total_rusdc_supply = vault.total_rusdc_supply + amount;
+        // 7. Mint RUSDC based on current exchange rate
+        let rusdc_to_mint = if (vault.exchange_rate == 0) {
+            // First deposit: 1:1 ratio
+            vault.exchange_rate = yield_math::get_precision(); // 1.0 with precision
+            (amount as u128)
+        } else {
+            // Calculate RUSDC amount based on current exchange rate
+            ((amount as u128) * yield_math::get_precision()) / vault.exchange_rate
+        };
+        
+        mint_rusdc(user_addr, (rusdc_to_mint as u64));
 
-        // 4. Emit event
+        // 8. Update total stats
+        vault.total_usdc = vault.total_usdc + amount;
+        vault.total_rusdc_supply = vault.total_rusdc_supply + (rusdc_to_mint as u64);
+
+        // 9. Emit event
         event::emit(
             DepositedEvent {
                 user: user_addr,
                 usdc_amount: amount,
-                rusdc_amount: amount,
+                rusdc_amount: (rusdc_to_mint as u64),
                 timestamp: now_seconds()
             }
         );
     }
 
-    public entry fun withdraw(sender: &signer, rusdc_amount: u64) acquires Config, RUSDCToken, Vault {
+    public entry fun withdraw(sender: &signer, rusdc_amount: u64) acquires Config, RUSDCToken, Vault, AllocationConfig {
         assert!(rusdc_amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
 
         let config = borrow_global<Config>(@riverfi);
@@ -163,38 +240,99 @@ module riverfi::vault {
 
         let user_addr = signer::address_of(sender);
         let vault_addr = get_vault_address();
+        
+        // 1. Harvest yield first to get latest exchange rate
+        harvest_yield_internal();
+        
         let vault = borrow_global_mut<Vault>(vault_addr);
 
-        // Check user has enough RUSDC
+        // 2. Check user has enough RUSDC
         let rusdc_token = get_rusdc_token();
         let user_rusdc_balance = primary_fungible_store::balance(user_addr, rusdc_token);
         assert!(user_rusdc_balance >= rusdc_amount, error::invalid_argument(E_INSUFFICIENT_BALANCE));
 
-        // Check vault has enough USDC
-        assert!(vault.reserve_usdc >= rusdc_amount, error::invalid_argument(E_INSUFFICIENT_VAULT_BALANCE));
+        // 3. Calculate USDC amount using current exchange rate (INCLUDING YIELD!)
+        let usdc_to_receive = if (vault.exchange_rate == 0) {
+            vault.exchange_rate = yield_math::get_precision(); // Initialize if needed
+            (rusdc_amount as u128)
+        } else {
+            // USDC = RUSDC × exchange_rate ÷ precision
+            ((rusdc_amount as u128) * vault.exchange_rate) / yield_math::get_precision()
+        };
+        let usdc_amount = (usdc_to_receive as u64);
 
-        // 1. Burn RUSDC from user
+        // 4. Ensure we have enough liquidity - unwind positions if needed
+        let vault_signer = get_vault_signer(vault);
+        
+        if (vault.reserve_usdc < usdc_amount) {
+            // Need to withdraw from protocols to cover the shortfall
+            let shortfall = usdc_amount - vault.reserve_usdc;
+            unwind_positions_for_liquidity(&vault_signer, vault, shortfall);
+        };
+
+        // 5. Burn RUSDC from user
         burn_rusdc(user_addr, rusdc_amount);
 
-        // 2. Transfer USDC from vault to user (using vault signer - CRITICAL!)
-        let vault_signer = get_vault_signer(vault);
-        let usdc_metadata = object::address_to_object<Metadata>(@usdc);
-        primary_fungible_store::transfer(&vault_signer, usdc_metadata, user_addr, rusdc_amount);
+        // 6. Transfer USDC to user (with yield included!)
+        let usdc_metadata = mock_usdc::get_token();
+        primary_fungible_store::transfer(&vault_signer, usdc_metadata, user_addr, usdc_amount);
 
-        // 3. Update vault stats
-        vault.total_usdc = vault.total_usdc - rusdc_amount;
+        // 7. Update vault stats
+        vault.total_usdc = if (vault.total_usdc >= usdc_amount) {
+            vault.total_usdc - usdc_amount
+        } else { 0 };
         vault.total_rusdc_supply = vault.total_rusdc_supply - rusdc_amount;
-        vault.reserve_usdc = vault.reserve_usdc - rusdc_amount;
+        vault.reserve_usdc = if (vault.reserve_usdc >= usdc_amount) {
+            vault.reserve_usdc - usdc_amount
+        } else { 0 };
 
-        // 4. Emit event
+        // 8. Emit event showing actual USDC received (including yield)
         event::emit(
             WithdrawnEvent {
                 user: user_addr,
                 rusdc_amount,
-                usdc_amount: rusdc_amount,
+                usdc_amount,
                 timestamp: now_seconds()
             }
         );
+    }
+
+    /// Harvest yield from mock protocols and update RUSDC exchange rate
+    public entry fun harvest_yield() acquires Vault {
+        harvest_yield_internal();
+    }
+
+    /// Set allocation percentages (admin only)
+    public entry fun admin_set_allocation(
+        admin: &signer,
+        tapp_percent: u8,
+        hyperion_percent: u8,
+        reserve_percent: u8
+    ) acquires AllocationConfig {
+        assert!(signer::address_of(admin) == @riverfi, error::permission_denied(E_ALREADY_INITIALIZED));
+        assert!(tapp_percent + hyperion_percent + reserve_percent == 100, error::invalid_argument(E_ZERO_AMOUNT));
+        
+        let allocation_config = borrow_global_mut<AllocationConfig>(@riverfi);
+        
+        let old_tapp = allocation_config.tapp_percent;
+        let old_hyperion = allocation_config.hyperion_percent;
+        let old_reserve = allocation_config.reserve_percent;
+        
+        allocation_config.tapp_percent = tapp_percent;
+        allocation_config.hyperion_percent = hyperion_percent;
+        allocation_config.reserve_percent = reserve_percent;
+        allocation_config.last_rebalance_ts = now_seconds();
+        
+        event::emit(AllocationUpdateEvent {
+            old_tapp_percent: old_tapp,
+            old_hyperion_percent: old_hyperion,
+            old_reserve_percent: old_reserve,
+            new_tapp_percent: tapp_percent,
+            new_hyperion_percent: hyperion_percent,
+            new_reserve_percent: reserve_percent,
+            admin: signer::address_of(admin),
+            timestamp: now_seconds()
+        });
     }
 
     // -- View Functions
@@ -204,6 +342,71 @@ module riverfi::vault {
         let vault = borrow_global<Vault>(vault_addr);
 
         (vault.total_usdc, vault.total_rusdc_supply, vault.hyperion_usdc, vault.reserve_usdc)
+    }
+
+    #[view]
+    public fun get_vault_nav(): (u128, u128) acquires Vault {
+        let vault_addr = get_vault_address();
+        let vault = borrow_global<Vault>(vault_addr);
+        
+        // Get current values from mock protocols
+        let tapp_value = if (vault.tapp_shares > 0) {
+            tapp_exchange::get_vault_value(vault_addr)
+        } else { 0 };
+        
+        let hyperion_value = if (vault.hyperion_lp_tokens > 0) {
+            hyperion::get_vault_value(vault_addr)
+        } else { 0 };
+        
+        let total_nav = tapp_value + hyperion_value + (vault.reserve_usdc as u128);
+        (total_nav, vault.exchange_rate)
+    }
+
+    #[view]
+    public fun get_protocol_positions(): (u128, u128, u64) acquires Vault {
+        let vault_addr = get_vault_address();
+        let vault = borrow_global<Vault>(vault_addr);
+        (vault.tapp_shares, vault.hyperion_lp_tokens, vault.reserve_usdc)
+    }
+
+    #[view]
+    public fun get_allocation_config(): (u8, u8, u8) acquires AllocationConfig {
+        let config = borrow_global<AllocationConfig>(@riverfi);
+        (config.tapp_percent, config.hyperion_percent, config.reserve_percent)
+    }
+
+    #[view]
+    public fun projected_apy(): (u64, u64) {
+        // Return projected APY from both protocols
+        let tapp_apr = tapp_exchange::get_apr();
+        let hyperion_apr = hyperion::get_apr();
+        (tapp_apr, hyperion_apr)
+    }
+
+    /// Get user's current position with yield preview
+    #[view]
+    public fun get_user_position(user: address): (u64, u64, u64, u128) acquires RUSDCToken, Vault {
+        let rusdc_balance = get_user_balance(user);
+        if (rusdc_balance == 0) {
+            return (0, 0, 0, 0)
+        };
+        
+        let vault_addr = get_vault_address();
+        let vault = borrow_global<Vault>(vault_addr);
+        
+        let exchange_rate = if (vault.exchange_rate == 0) {
+            yield_math::get_precision() // 1.0
+        } else {
+            vault.exchange_rate
+        };
+        
+        let usdc_value = (((rusdc_balance as u128) * exchange_rate) / yield_math::get_precision() as u64);
+        let yield_earned = if (usdc_value > rusdc_balance) {
+            usdc_value - rusdc_balance
+        } else { 0 };
+        
+        (rusdc_balance, usdc_value, yield_earned, exchange_rate)
+        // Returns: (RUSDC tokens, Current USDC value, Yield earned, Current exchange rate)
     }
 
     #[view]
@@ -234,8 +437,18 @@ module riverfi::vault {
             extend_ref,
             total_usdc: 0,
             total_rusdc_supply: 0,
-            hyperion_usdc: 0,
             reserve_usdc: 0,
+            
+            // Mock Protocol Positions
+            tapp_shares: 0,
+            hyperion_lp_tokens: 0,
+            
+            // NAV tracking
+            exchange_rate: 0,
+            last_harvest_ts: now_seconds(),
+            
+            // Legacy fields
+            hyperion_usdc: 0,
             hyperion_positions: vector::empty(),
         });
     }
@@ -284,6 +497,131 @@ module riverfi::vault {
 
     fun get_vault_signer(vault: &Vault): signer {
         object::generate_signer_for_extending(&vault.extend_ref)
+    }
+
+    // -- Private Functions
+    
+    /// Unwind protocol positions to provide liquidity for withdrawals
+    fun unwind_positions_for_liquidity(vault_signer: &signer, vault: &mut Vault, needed_amount: u64) acquires AllocationConfig {
+        let vault_addr = signer::address_of(vault_signer);
+        let allocation_config = borrow_global<AllocationConfig>(@riverfi);
+        let remaining_needed = needed_amount;
+        
+        // Try to get liquidity proportionally from protocols based on allocation
+        let total_protocol_percent = allocation_config.tapp_percent + allocation_config.hyperion_percent;
+        if (total_protocol_percent == 0) return; // No protocols to unwind
+        
+        // Calculate how much to withdraw from each protocol
+        let tapp_target = (remaining_needed * (allocation_config.tapp_percent as u64)) / (total_protocol_percent as u64);
+        let hyperion_target = remaining_needed - tapp_target;
+        
+        // Unwind from Tapp Exchange
+        if (tapp_target > 0 && vault.tapp_shares > 0) {
+            let tapp_current_value = tapp_exchange::get_vault_value(vault_addr);
+            if (tapp_current_value > 0) {
+                let shares_to_withdraw = if (tapp_target >= (tapp_current_value as u64)) {
+                    // Withdraw all shares
+                    vault.tapp_shares
+                } else {
+                    // Withdraw proportional shares
+                    (vault.tapp_shares * (tapp_target as u128)) / tapp_current_value
+                };
+                
+                if (shares_to_withdraw > 0) {
+                    let received = tapp_exchange::vault_withdraw(vault_signer, shares_to_withdraw);
+                    vault.tapp_shares = vault.tapp_shares - shares_to_withdraw;
+                    vault.reserve_usdc = vault.reserve_usdc + received;
+                };
+            };
+        };
+        
+        // Unwind from Hyperion
+        if (hyperion_target > 0 && vault.hyperion_lp_tokens > 0) {
+            let hyperion_current_value = hyperion::get_vault_value(vault_addr);
+            if (hyperion_current_value > 0) {
+                let lp_tokens_to_withdraw = if (hyperion_target >= (hyperion_current_value as u64)) {
+                    // Withdraw all LP tokens
+                    vault.hyperion_lp_tokens
+                } else {
+                    // Withdraw proportional LP tokens
+                    (vault.hyperion_lp_tokens * (hyperion_target as u128)) / hyperion_current_value
+                };
+                
+                if (lp_tokens_to_withdraw > 0) {
+                    let received = hyperion::vault_remove_liquidity(vault_signer, lp_tokens_to_withdraw);
+                    vault.hyperion_lp_tokens = vault.hyperion_lp_tokens - lp_tokens_to_withdraw;
+                    vault.reserve_usdc = vault.reserve_usdc + received;
+                };
+            };
+        };
+    }
+    
+    fun harvest_yield_internal() acquires Vault {
+        let vault_addr = get_vault_address();
+        let vault = borrow_global_mut<Vault>(vault_addr);
+        
+        // Skip if no RUSDC supply
+        if (vault.total_rusdc_supply == 0) {
+            return
+        };
+        
+        // Compound yields in both protocols
+        if (vault.tapp_shares > 0) {
+            tapp_exchange::compound_yield();
+        };
+        
+        if (vault.hyperion_lp_tokens > 0) {
+            hyperion::compound_rewards();
+        };
+        
+        // Calculate current NAV
+        let tapp_value = if (vault.tapp_shares > 0) {
+            tapp_exchange::get_vault_value(vault_addr)
+        } else { 0 };
+        
+        let hyperion_value = if (vault.hyperion_lp_tokens > 0) {
+            hyperion::get_vault_value(vault_addr)
+        } else { 0 };
+        
+        let total_nav = tapp_value + hyperion_value + (vault.reserve_usdc as u128);
+        
+        // Calculate new exchange rate
+        let old_exchange_rate = vault.exchange_rate;
+        if (old_exchange_rate == 0) {
+            vault.exchange_rate = yield_math::get_precision(); // Initialize to 1.0
+        } else {
+            // New rate = total_nav / total_rusdc_supply
+            vault.exchange_rate = (total_nav * yield_math::get_precision()) / (vault.total_rusdc_supply as u128);
+        };
+        
+        let yield_earned = if (vault.exchange_rate > old_exchange_rate && old_exchange_rate > 0) {
+            // Calculate yield in USDC terms
+            let old_nav = (old_exchange_rate * (vault.total_rusdc_supply as u128)) / yield_math::get_precision();
+            total_nav - old_nav
+        } else {
+            0
+        };
+        
+        vault.last_harvest_ts = now_seconds();
+        
+        // Emit harvest event
+        event::emit(HarvestEvent {
+            tapp_value,
+            hyperion_value,
+            total_nav,
+            old_exchange_rate,
+            new_exchange_rate: vault.exchange_rate,
+            yield_earned,
+            timestamp: now_seconds()
+        });
+        
+        if (vault.exchange_rate != old_exchange_rate) {
+            event::emit(ExchangeRateUpdateEvent {
+                old_rate: old_exchange_rate,
+                new_rate: vault.exchange_rate,
+                timestamp: now_seconds()
+            });
+        };
     }
 
     // -- Test Only

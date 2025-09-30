@@ -5,23 +5,21 @@ upgrade_policy = "compatible"
 authors = []
 
 [addresses]
-riverfi = "_"
-deployer = "_"
-dex_contract = "_"
-usdc = "0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832"
-usdt = "0xd5d0d561493ea2b9410f67da804653ae44e793c2423707d4f11edb2e38192050"
+riverfi = "0xefa490deb584bf7423c8fdd1b5a06c869d99bbe4608ba5edfb6ed1fc63b3294a"
+deployer = "0xefa490deb584bf7423c8fdd1b5a06c869d99bbe4608ba5edfb6ed1fc63b3294a"
 
 [dev-addresses]
-riverfi = "0xFACE"
+riverfi = "0xefa490deb584bf7423c8fdd1b5a06c869d99bbe4608ba5edfb6ed1fc63b3294a"
 deployer = "0xBB"
-dex_contract = "0xAA"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-framework.git"
 rev = "mainnet"
 subdir = "aptos-framework"
-[dependencies.dex]
-git = "https://github.com/Hyperfluid/hyperfluid-interface"
-rev = "main"
+
+# Note: dex dependency removed since we're using mock protocols
+# [dependencies.dex]
+# git = "https://github.com/Hyperfluid/hyperfluid-interface"
+# rev = "main"
 
 [dev-dependencies]
