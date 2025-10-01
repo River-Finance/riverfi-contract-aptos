@@ -271,6 +271,10 @@ module riverfi::tapp_exchange {
         assert_not_paused();
         assert!(amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
         
+        // Transfer USDC from vault to Tapp Exchange
+        let usdc_metadata = mock_usdc::get_token();
+        primary_fungible_store::transfer(vault_signer, usdc_metadata, @riverfi, amount);
+        
         // Compound existing yield first
         compound_yield_internal();
         
@@ -290,11 +294,11 @@ module riverfi::tapp_exchange {
         
         // Update or create vault position
         if (table::contains(&vault.positions, vault_addr)) {
-            let position = table::borrow_mut(&mut vault.positions, vault_addr);
-            position.shares = position.shares + shares_to_mint;
+            let position = vault.positions.borrow_mut(vault_addr);
+            position.shares += shares_to_mint;
             position.last_update_ts = now_seconds();
         } else {
-            table::add(&mut vault.positions, vault_addr, Position {
+            vault.positions.add(vault_addr, Position {
                 shares: shares_to_mint,
                 last_update_ts: now_seconds(),
             });
@@ -302,7 +306,7 @@ module riverfi::tapp_exchange {
         
         // Simulate trading fees
         let simulated_fee = ((amount as u128) * (FEE_BPS as u128)) / 10000;
-        vault.accumulated_fees = vault.accumulated_fees + simulated_fee;
+        vault.accumulated_fees += simulated_fee;
         
         shares_to_mint
     }
@@ -320,9 +324,9 @@ module riverfi::tapp_exchange {
         let vault_addr = signer::address_of(vault_signer);
         
         // Check vault has position
-        assert!(table::contains(&vault.positions, vault_addr), error::not_found(E_NO_POSITION));
+        assert!(vault.positions.contains(vault_addr), error::not_found(E_NO_POSITION));
         
-        let position = table::borrow_mut(&mut vault.positions, vault_addr);
+        let position = vault.positions.borrow_mut(vault_addr);
         assert!(position.shares >= shares, error::invalid_argument(E_INSUFFICIENT_SHARES));
         
         // Calculate withdrawal amount (includes yield)
@@ -333,16 +337,30 @@ module riverfi::tapp_exchange {
         );
         
         // Update position
-        position.shares = position.shares - shares;
+        position.shares -= shares;
         if (position.shares == 0) {
-            table::remove(&mut vault.positions, vault_addr);
+            vault.positions.remove(vault_addr);
         };
         
         // Update vault state
         let yield_portion = (shares * vault.accumulated_fees) / vault.total_shares;
-        vault.total_deposited = vault.total_deposited - (withdrawal_amount - yield_portion);
-        vault.total_shares = vault.total_shares - shares;
-        vault.accumulated_fees = vault.accumulated_fees - yield_portion;
+        vault.total_deposited -= (withdrawal_amount - yield_portion);
+        vault.total_shares -= shares;
+        vault.accumulated_fees -= yield_portion;
+        
+        // Transfer USDC back to vault from protocol reserves
+        let usdc_metadata = mock_usdc::get_token();
+        let riverfi_balance = primary_fungible_store::balance(@riverfi, usdc_metadata);
+        let transfer_amount = if (riverfi_balance >= (withdrawal_amount as u64)) {
+            (withdrawal_amount as u64)
+        } else {
+            riverfi_balance
+        };
+        
+        if (transfer_amount > 0) {
+            // For MVP: Admin transfers from @riverfi reserves to vault
+            // In production, this would be automated resource account transfer
+        };
         
         (withdrawal_amount as u64)
     }
@@ -354,11 +372,11 @@ module riverfi::tapp_exchange {
         
         let vault = borrow_global<TappVault>(@riverfi);
         
-        if (!table::contains(&vault.positions, vault_addr)) {
+        if (!vault.positions.contains(vault_addr)) {
             return 0
         };
         
-        let position = table::borrow(&vault.positions, vault_addr);
+        let position = vault.positions.borrow(vault_addr);
         
         yield_math::calculate_withdrawal(
             position.shares,
@@ -373,11 +391,11 @@ module riverfi::tapp_exchange {
     public fun get_position(user: address): (u128, u128) acquires TappVault {
         let vault = borrow_global<TappVault>(@riverfi);
         
-        if (!table::contains(&vault.positions, user)) {
+        if (!vault.positions.contains(user)) {
             return (0, 0)
         };
         
-        let position = table::borrow(&vault.positions, user);
+        let position = vault.positions.borrow(user);
         let current_value = yield_math::calculate_withdrawal(
             position.shares,
             vault.total_deposited + vault.accumulated_fees,
@@ -430,7 +448,7 @@ module riverfi::tapp_exchange {
         
         if (yield_earned > 0) {
             // Add yield to accumulated fees (representing trading fee earnings)
-            vault.accumulated_fees = vault.accumulated_fees + yield_earned;
+            vault.accumulated_fees += yield_earned;
             
             config.last_compound_ts = current_time;
             
@@ -444,6 +462,10 @@ module riverfi::tapp_exchange {
     
     fun assert_not_paused() acquires TappConfig {
         assert!(!borrow_global<TappConfig>(@riverfi).is_paused, error::unavailable(E_PAUSED));
+    }
+    
+    fun get_admin_address(): address acquires TappConfig {
+        borrow_global<TappConfig>(@riverfi).admin
     }
     
     // Test Functions

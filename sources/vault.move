@@ -4,6 +4,7 @@ module riverfi::vault {
     use std::string;
     use std::option;
     use std::vector;
+    use std::table;
     use aptos_framework::object::{Self, Object, ExtendRef};
     use aptos_framework::event;
     use aptos_framework::fungible_asset::{Self, Metadata, MintRef, TransferRef, BurnRef};
@@ -13,20 +14,27 @@ module riverfi::vault {
     use riverfi::storage;
     use riverfi::tapp_exchange;
     use riverfi::hyperion;
-    use riverfi::yield_math;
     use riverfi::mock_usdc;
     use riverfi::hyperion_strategy;
 
     // -- Constants
-    const RUSDC_TOKEN_NAME: vector<u8> = b"River USDC";
-    const RUSDC_TOKEN_SYMBOL: vector<u8> = b"RUSDC";
-    const RUSDC_TOKEN_DECIMALS: u8 = 6;
+    const RUSD_TOKEN_NAME: vector<u8> = b"River USD";
+    const RUSD_TOKEN_SYMBOL: vector<u8> = b"RUSD";
+    const RUSD_TOKEN_DECIMALS: u8 = 6;
     const VAULT_SEED: vector<u8> = b"vault::VAULT";
+    
+    // Fixed 1:1 exchange rate with USDC
+    const FIXED_EXCHANGE_RATE: u128 = 1000000000000; // 1.0 with precision (1e12)
 
-    // Mock Protocol allocation (50% Tapp, 30% Hyperion, 20% Reserve)
-    const DEFAULT_TAPP_ALLOCATION_PERCENT: u8 = 50;   // 50% to Tapp Exchange
-    const DEFAULT_HYPERION_ALLOCATION_PERCENT: u8 = 30; // 30% to Hyperion
-    const DEFAULT_RESERVE_ALLOCATION_PERCENT: u8 = 20; // 20% instant liquidity
+    // (70% Hyperion, 30% Tapp, 0% Reserve)
+    const DEFAULT_TAPP_ALLOCATION_PERCENT: u8 = 30;
+    const DEFAULT_HYPERION_ALLOCATION_PERCENT: u8 = 70;
+    const DEFAULT_RESERVE_ALLOCATION_PERCENT: u8 = 0;
+    
+    // Default yield settings
+    const DEFAULT_ANNUAL_APY_BPS: u64 = 1000; // 10% APY = 1000 basis points
+    const DAYS_PER_YEAR: u64 = 365;
+    const SECONDS_PER_DAY: u64 = 86400; // 24 * 60 * 60
     const APT_ADDRESS: address = @0x1; // APT token address
 
     // -- Errors
@@ -48,32 +56,46 @@ module riverfi::vault {
         last_rebalance_ts: u64,
     }
 
-    struct RUSDCToken has key {
+    struct RUSDToken has key {
         token: Object<Metadata>,
         mint_ref: MintRef,
         transfer_ref: TransferRef,
         burn_ref: BurnRef,
         extend_ref: ExtendRef
     }
+    
+    // Yield pool for automatic yield distribution
+    struct YieldPool has key {
+        total_claimable_yield: u64,     // Total RUSD in yield pool (for manual claims)
+        total_rusd_earning: u64,        // Total RUSD tokens earning yield
+        annual_apy_bps: u64,            // Annual APY in basis points (e.g., 1000 = 10%)
+        last_yield_accrual_ts: u64,     // Last time daily yield was accrued
+        user_last_claim_ts: table::Table<address, u64>, // User's last claim timestamp
+        auto_distribute_yield: bool,    // Whether to auto-distribute yield or require claims
+        total_yield_distributed: u64,   // Total yield distributed automatically
+        last_distribution_time: u64,    // Last automatic distribution timestamp
+        yield_per_token_accumulated: u64, // Accumulated yield per token (scaled by 1e12)
+        user_yield_debt: table::Table<address, u64>, // User's yield debt for reward calculation
+    }
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
     struct Vault has key {
         extend_ref: ExtendRef,
         total_usdc: u64,
-        total_rusdc_supply: u64,
-        reserve_usdc: u64,   // Amount kept in vault for instant withdrawals
+        total_rusd_supply: u64,         // Total RUSD tokens in circulation
         
         // Mock Protocol Positions
-        tapp_shares: u128,      // Shares in Tapp Exchange
-        hyperion_lp_tokens: u128, // LP tokens in Hyperion
+        tapp_shares: u128,              // Shares in Tapp Exchange
+        hyperion_lp_tokens: u128,       // LP tokens in Hyperion
         
-        // NAV tracking
-        exchange_rate: u128,    // USDC per RUSDC (scaled by 1e12)
-        last_harvest_ts: u64,   // Last time yields were harvested
+        // Fixed exchange rate (always 1:1)
+        exchange_rate: u128,            // Always FIXED_EXCHANGE_RATE
+        last_harvest_ts: u64,           // Last time yields were harvested
         
-        // Legacy Hyperion positions (for backward compatibility)
+        // Legacy fields (kept for backward compatibility but not used)
         hyperion_positions: vector<Object<riverfi::hyperion_strategy::Info>>,
-        hyperion_usdc: u64,  // Amount deposited to real Hyperion
+        hyperion_usdc: u64,
+        reserve_usdc: u64,              // Not used anymore (0% allocation)
     }
 
     // -- Events
@@ -81,14 +103,14 @@ module riverfi::vault {
     struct DepositedEvent has drop, store {
         user: address,
         usdc_amount: u64,
-        rusdc_amount: u64,
+        rusd_amount: u64,
         timestamp: u64
     }
 
     #[event]
     struct WithdrawnEvent has drop, store {
         user: address,
-        rusdc_amount: u64,
+        rusd_amount: u64,
         usdc_amount: u64,
         timestamp: u64
     }
@@ -128,6 +150,61 @@ module riverfi::vault {
         new_rate: u128,
         timestamp: u64
     }
+    
+    // New Yield Events
+    #[event]
+    struct ManualYieldAddedEvent has drop, store {
+        admin: address,
+        usdc_amount: u64,
+        rusd_minted: u64,
+        timestamp: u64
+    }
+    
+    #[event]
+    struct DailyYieldAccruedEvent has drop, store {
+        total_earning_rusd: u64,
+        daily_rate_bps: u64,
+        yield_accrued: u64,
+        timestamp: u64
+    }
+    
+    #[event]
+    struct YieldClaimedEvent has drop, store {
+        user: address,
+        claimed_amount: u64,
+        timestamp: u64
+    }
+    
+    #[event]
+    struct YieldRateChangedEvent has drop, store {
+        old_rate_bps: u64,
+        new_rate_bps: u64,
+        admin: address,
+        timestamp: u64
+    }
+    
+    #[event]
+    struct TransferEvent has drop, store {
+        from: address,
+        to: address,
+        amount: u64,
+        timestamp: u64
+    }
+    
+    #[event]
+    struct AutoYieldDistributedEvent has drop, store {
+        total_yield_distributed: u64,
+        recipients_count: u64,
+        apy_rate_bps: u64,
+        timestamp: u64
+    }
+    
+    #[event]
+    struct YieldDistributedEvent has drop, store {
+        total_amount: u64,
+        distributed_to_holders: bool,
+        timestamp: u64
+    }
 
     // -- Init
     fun init_module(sender: &signer) {
@@ -158,12 +235,29 @@ module riverfi::vault {
                 last_rebalance_ts: now_seconds(),
             }
         );
+        
+        // Initialize yield pool
+        move_to(
+            sender,
+            YieldPool {
+                total_claimable_yield: 0,
+                total_rusd_earning: 0,
+                annual_apy_bps: DEFAULT_ANNUAL_APY_BPS, // Default 10% APY
+                last_yield_accrual_ts: now_seconds(),
+                user_last_claim_ts: table::new(),
+                auto_distribute_yield: true, // Enable auto-distribution by default
+                total_yield_distributed: 0,
+                last_distribution_time: now_seconds(),
+                yield_per_token_accumulated: 0,
+                user_yield_debt: table::new(),
+            }
+        );
 
-        init_rusdc_token(sender);
+        init_rusd_token(sender);
     }
 
     // -- Public Entry Functions
-    public entry fun deposit(sender: &signer, amount: u64) acquires Config, RUSDCToken, Vault, AllocationConfig {
+    public entry fun deposit(sender: &signer, amount: u64) acquires Config, RUSDToken, Vault, AllocationConfig, YieldPool {
         assert!(amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
 
         let config = borrow_global<Config>(@riverfi);
@@ -172,8 +266,8 @@ module riverfi::vault {
         let user_addr = signer::address_of(sender);
         let vault_addr = get_vault_address();
         
-        // Harvest existing yield before new deposit
-        harvest_yield_internal();
+        // Accrue daily yield before new deposit
+        accrue_daily_yield_internal();
         
         let vault = borrow_global_mut<Vault>(vault_addr);
 
@@ -181,11 +275,11 @@ module riverfi::vault {
         let usdc_metadata = mock_usdc::get_token();
         primary_fungible_store::transfer(sender, usdc_metadata, vault_addr, amount);
 
-        // 2. Calculate allocation amounts
+        // 2. Calculate allocation amounts (70% Hyperion, 30% Tapp, 0% Reserve)
         let allocation_config = borrow_global<AllocationConfig>(@riverfi);
         let tapp_amount = (amount * (allocation_config.tapp_percent as u64)) / 100;
         let hyperion_amount = (amount * (allocation_config.hyperion_percent as u64)) / 100;
-        let reserve_amount = amount - tapp_amount - hyperion_amount;
+        // No reserve allocation anymore
 
         // 3. Get vault signer for protocol deposits
         let vault_signer = get_vault_signer(vault);
@@ -202,38 +296,37 @@ module riverfi::vault {
             vault.hyperion_lp_tokens = vault.hyperion_lp_tokens + new_lp_tokens;
         };
 
-        // 6. Keep remainder in reserve
-        vault.reserve_usdc = vault.reserve_usdc + reserve_amount;
-
-        // 7. Mint RUSDC based on current exchange rate
-        let rusdc_to_mint = if (vault.exchange_rate == 0) {
-            // First deposit: 1:1 ratio
-            vault.exchange_rate = yield_math::get_precision(); // 1.0 with precision
-            (amount as u128)
-        } else {
-            // Calculate RUSDC amount based on current exchange rate
-            ((amount as u128) * yield_math::get_precision()) / vault.exchange_rate
-        };
+        // 6. Claim any pending yield rewards for the user before balance changes
+        claim_yield_rewards(user_addr);
         
-        mint_rusdc(user_addr, (rusdc_to_mint as u64));
-
-        // 8. Update total stats
+        // 7. Mint RUSD tokens 1:1 with USDC (fixed exchange rate)
+        vault.exchange_rate = FIXED_EXCHANGE_RATE; // Always maintain 1:1 ratio
+        let rusd_to_mint = amount; // 1:1 ratio with USDC
+        mint_rusd(user_addr, rusd_to_mint);
+        
+        // 8. Update user's yield debt for the new balance
+        let new_balance = get_user_balance(user_addr);
+        update_user_yield_debt(user_addr, new_balance);
+        
+        // 9. Update vault state
         vault.total_usdc = vault.total_usdc + amount;
-        vault.total_rusdc_supply = vault.total_rusdc_supply + (rusdc_to_mint as u64);
-
-        // 9. Emit event
-        event::emit(
-            DepositedEvent {
-                user: user_addr,
-                usdc_amount: amount,
-                rusdc_amount: (rusdc_to_mint as u64),
-                timestamp: now_seconds()
-            }
-        );
+        vault.total_rusd_supply = vault.total_rusd_supply + rusd_to_mint;
+        
+        // 10. Track earning RUSD tokens (all deposited RUSD earns yield)
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        yield_pool.total_rusd_earning = yield_pool.total_rusd_earning + rusd_to_mint;
+        
+        // 11. Emit deposit event
+        event::emit(DepositedEvent {
+            user: user_addr,
+            usdc_amount: amount,
+            rusd_amount: rusd_to_mint,
+            timestamp: now_seconds()
+        });
     }
 
-    public entry fun withdraw(sender: &signer, rusdc_amount: u64) acquires Config, RUSDCToken, Vault, AllocationConfig {
-        assert!(rusdc_amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
+    public entry fun withdraw(sender: &signer, rusd_amount: u64) acquires Config, RUSDToken, Vault, AllocationConfig, YieldPool {
+        assert!(rusd_amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
 
         let config = borrow_global<Config>(@riverfi);
         assert!(config.enable_withdraw, error::permission_denied(E_ALREADY_INITIALIZED));
@@ -241,65 +334,208 @@ module riverfi::vault {
         let user_addr = signer::address_of(sender);
         let vault_addr = get_vault_address();
         
-        // 1. Harvest yield first to get latest exchange rate
-        harvest_yield_internal();
+        // 1. Accrue daily yield first
+        accrue_daily_yield_internal();
         
         let vault = borrow_global_mut<Vault>(vault_addr);
 
-        // 2. Check user has enough RUSDC
-        let rusdc_token = get_rusdc_token();
-        let user_rusdc_balance = primary_fungible_store::balance(user_addr, rusdc_token);
-        assert!(user_rusdc_balance >= rusdc_amount, error::invalid_argument(E_INSUFFICIENT_BALANCE));
+        // 2. Check user has enough RUSD
+        let rusd_token = get_rusd_token();
+        let user_rusd_balance = primary_fungible_store::balance(user_addr, rusd_token);
+        assert!(user_rusd_balance >= rusd_amount, error::invalid_argument(E_INSUFFICIENT_BALANCE));
 
-        // 3. Calculate USDC amount using current exchange rate (INCLUDING YIELD!)
-        let usdc_to_receive = if (vault.exchange_rate == 0) {
-            vault.exchange_rate = yield_math::get_precision(); // Initialize if needed
-            (rusdc_amount as u128)
-        } else {
-            // USDC = RUSDC × exchange_rate ÷ precision
-            ((rusdc_amount as u128) * vault.exchange_rate) / yield_math::get_precision()
-        };
-        let usdc_amount = (usdc_to_receive as u64);
+        // 3. Calculate USDC amount using fixed 1:1 exchange rate
+        vault.exchange_rate = FIXED_EXCHANGE_RATE; // Ensure fixed rate
+        let usdc_amount = rusd_amount; // 1:1 ratio
 
-        // 4. Ensure we have enough liquidity - unwind positions if needed
-        let vault_signer = get_vault_signer(vault);
+        // 4. Claim any pending yield rewards before balance changes
+        claim_yield_rewards(user_addr);
         
-        if (vault.reserve_usdc < usdc_amount) {
-            // Need to withdraw from protocols to cover the shortfall
-            let shortfall = usdc_amount - vault.reserve_usdc;
-            unwind_positions_for_liquidity(&vault_signer, vault, shortfall);
-        };
+        // 5. Always unwind positions from protocols (no reserve)
+        let vault_signer = get_vault_signer(vault);
+        unwind_positions_for_liquidity(&vault_signer, vault, usdc_amount);
 
-        // 5. Burn RUSDC from user
-        burn_rusdc(user_addr, rusdc_amount);
+        // 6. Burn RUSD from user
+        burn_rusd(user_addr, rusd_amount);
+        
+        // 7. Update user's yield debt for the new balance
+        let new_balance = get_user_balance(user_addr);
+        update_user_yield_debt(user_addr, new_balance);
 
-        // 6. Transfer USDC to user (with yield included!)
+        // 8. Transfer USDC from riverfi to user (1:1 ratio)
         let usdc_metadata = mock_usdc::get_token();
+        let riverfi_balance = primary_fungible_store::balance(@riverfi, usdc_metadata);
+        assert!(riverfi_balance >= usdc_amount, error::resource_exhausted(E_INSUFFICIENT_VAULT_BALANCE));
+
+        // Use vault signer to transfer from riverfi (since protocols store USDC there)
         primary_fungible_store::transfer(&vault_signer, usdc_metadata, user_addr, usdc_amount);
 
-        // 7. Update vault stats
+        // 9. Update vault stats and yield pool
         vault.total_usdc = if (vault.total_usdc >= usdc_amount) {
             vault.total_usdc - usdc_amount
         } else { 0 };
-        vault.total_rusdc_supply = vault.total_rusdc_supply - rusdc_amount;
-        vault.reserve_usdc = if (vault.reserve_usdc >= usdc_amount) {
-            vault.reserve_usdc - usdc_amount
+        vault.total_rusd_supply = vault.total_rusd_supply - rusd_amount;
+        
+        // Update yield pool - reduce earning RUSD tokens
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        yield_pool.total_rusd_earning = if (yield_pool.total_rusd_earning >= rusd_amount) {
+            yield_pool.total_rusd_earning - rusd_amount
         } else { 0 };
 
-        // 8. Emit event showing actual USDC received (including yield)
+        // 8. Emit event showing USDC received (1:1 ratio)
         event::emit(
             WithdrawnEvent {
                 user: user_addr,
-                rusdc_amount,
+                rusd_amount,
                 usdc_amount,
                 timestamp: now_seconds()
             }
         );
     }
 
-    /// Harvest yield from mock protocols and update RUSDC exchange rate
-    public entry fun harvest_yield() acquires Vault {
-        harvest_yield_internal();
+    /// Admin function to manually add yield and distribute to all users
+    public entry fun admin_increase_yield(admin: &signer, usdc_amount: u64) acquires YieldPool, RUSDToken {
+        assert!(signer::address_of(admin) == @riverfi, error::permission_denied(E_ALREADY_INITIALIZED));
+        assert!(usdc_amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
+        
+        // Transfer USDC from admin to protocol
+        let usdc_metadata = mock_usdc::get_token();
+        primary_fungible_store::transfer(admin, usdc_metadata, @riverfi, usdc_amount);
+        
+        // Mint equivalent RUSD and distribute proportionally to all users
+        let rusd_amount = usdc_amount; // 1:1 ratio
+        
+        let yield_pool = borrow_global<YieldPool>(@riverfi);
+        if (yield_pool.auto_distribute_yield) {
+            // Distribute automatically to all token holders
+            distribute_yield_automatically(rusd_amount);
+        } else {
+            // Add to claimable pool for manual claims
+            mint_rusd_to_pool(rusd_amount);
+        };
+        
+        event::emit(ManualYieldAddedEvent {
+            admin: signer::address_of(admin),
+            usdc_amount,
+            rusd_minted: rusd_amount,
+            timestamp: now_seconds()
+        });
+    }
+    
+    /// Admin function to set annual APY rate
+    public entry fun admin_set_annual_apy(admin: &signer, apy_bps: u64) acquires YieldPool {
+        assert!(signer::address_of(admin) == @riverfi, error::permission_denied(E_ALREADY_INITIALIZED));
+        assert!(apy_bps <= 5000, error::invalid_argument(E_ZERO_AMOUNT)); // Max 50% APY
+        
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        let old_rate = yield_pool.annual_apy_bps;
+        yield_pool.annual_apy_bps = apy_bps;
+        
+        event::emit(YieldRateChangedEvent {
+            old_rate_bps: old_rate,
+            new_rate_bps: apy_bps,
+            admin: signer::address_of(admin),
+            timestamp: now_seconds()
+        });
+    }
+    
+    /// Admin function to toggle auto-yield distribution
+    public entry fun admin_set_auto_yield(admin: &signer, auto_distribute: bool) acquires YieldPool {
+        assert!(signer::address_of(admin) == @riverfi, error::permission_denied(E_ALREADY_INITIALIZED));
+        
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        yield_pool.auto_distribute_yield = auto_distribute;
+    }
+    
+    /// Transfer RUSD tokens to another user
+    public entry fun transfer(sender: &signer, to: address, amount: u64) acquires RUSDToken, YieldPool {
+        assert!(amount > 0, error::invalid_argument(E_ZERO_AMOUNT));
+        let from = signer::address_of(sender);
+        assert!(from != to, error::invalid_argument(E_ZERO_AMOUNT));
+        
+        // Accrue yield before transfer to ensure accurate balances
+        accrue_daily_yield_internal();
+        
+        // Claim pending yield rewards for both sender and recipient
+        claim_yield_rewards(from);
+        claim_yield_rewards(to);
+        
+        // Check sender has sufficient balance
+        let rusd_token = get_rusd_token();
+        let sender_balance = primary_fungible_store::balance(from, rusd_token);
+        assert!(sender_balance >= amount, error::invalid_argument(E_INSUFFICIENT_BALANCE));
+        
+        // Transfer RUSD tokens
+        let rusd = borrow_global<RUSDToken>(@riverfi);
+        primary_fungible_store::transfer_with_ref(
+            &rusd.transfer_ref,
+            from,
+            to,
+            amount
+        );
+        
+        // Update yield debt for both sender and recipient after balance changes
+        let sender_new_balance = get_user_balance(from);
+        let recipient_new_balance = get_user_balance(to);
+        update_user_yield_debt(from, sender_new_balance);
+        update_user_yield_debt(to, recipient_new_balance);
+        
+        // Emit transfer event
+        event::emit(TransferEvent {
+            from,
+            to,
+            amount,
+            timestamp: now_seconds()
+        });
+    }
+    
+    /// User function to claim daily yield (for manual claim mode only)
+    public entry fun claim_daily_yield(user: &signer) acquires YieldPool, RUSDToken {
+        let user_addr = signer::address_of(user);
+        
+        // Accrue yield first
+        accrue_daily_yield_internal();
+        
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        
+        // This function only works when auto-distribute is disabled
+        assert!(!yield_pool.auto_distribute_yield, error::invalid_state(E_ZERO_AMOUNT));
+        
+        // Calculate pending yield for user
+        let pending_yield = calculate_pending_yield_internal(user_addr, yield_pool);
+        assert!(pending_yield > 0, error::invalid_argument(E_ZERO_AMOUNT));
+        
+        // Update user's last claim timestamp
+        if (table::contains(&yield_pool.user_last_claim_ts, user_addr)) {
+            *table::borrow_mut(&mut yield_pool.user_last_claim_ts, user_addr) = now_seconds();
+        } else {
+            table::add(&mut yield_pool.user_last_claim_ts, user_addr, now_seconds());
+        };
+        
+        // Transfer yield from pool to user
+        transfer_rusd_from_pool(user_addr, pending_yield);
+        
+        event::emit(YieldClaimedEvent {
+            user: user_addr,
+            claimed_amount: pending_yield,
+            timestamp: now_seconds()
+        });
+    }
+    
+    /// User function to claim accumulated yield rewards (for auto-distribute mode)
+    public entry fun claim_rewards(user: &signer) acquires RUSDToken, YieldPool {
+        let user_addr = signer::address_of(user);
+        
+        // Accrue yield first
+        accrue_daily_yield_internal();
+        
+        let yield_pool = borrow_global<YieldPool>(@riverfi);
+        
+        // This function only works when auto-distribute is enabled
+        assert!(yield_pool.auto_distribute_yield, error::invalid_state(E_ZERO_AMOUNT));
+        
+        // Claim any pending rewards
+        claim_yield_rewards(user_addr);
     }
 
     /// Set allocation percentages (admin only)
@@ -341,7 +577,7 @@ module riverfi::vault {
         let vault_addr = get_vault_address();
         let vault = borrow_global<Vault>(vault_addr);
 
-        (vault.total_usdc, vault.total_rusdc_supply, vault.hyperion_usdc, vault.reserve_usdc)
+        (vault.total_usdc, vault.total_rusd_supply, vault.hyperion_usdc, vault.reserve_usdc)
     }
 
     #[view]
@@ -383,42 +619,69 @@ module riverfi::vault {
         (tapp_apr, hyperion_apr)
     }
 
-    /// Get user's current position with yield preview
+    /// Get user's current position with claimable yield
     #[view]
-    public fun get_user_position(user: address): (u64, u64, u64, u128) acquires RUSDCToken, Vault {
-        let rusdc_balance = get_user_balance(user);
-        if (rusdc_balance == 0) {
+    public fun get_user_position(user: address): (u64, u64, u64, u128) acquires RUSDToken, Vault, YieldPool {
+        let rusd_balance = get_user_balance(user);
+        if (rusd_balance == 0) {
             return (0, 0, 0, 0)
         };
         
         let vault_addr = get_vault_address();
         let vault = borrow_global<Vault>(vault_addr);
         
-        let exchange_rate = if (vault.exchange_rate == 0) {
-            yield_math::get_precision() // 1.0
+        // Calculate pending claimable yield based on distribution mode
+        let yield_pool = borrow_global<YieldPool>(@riverfi);
+        let claimable_yield = if (yield_pool.auto_distribute_yield) {
+            // For auto-distribute mode, show pending rewards
+            calculate_pending_yield_reward(user)
         } else {
-            vault.exchange_rate
+            // For manual claim mode, use the traditional calculation
+            calculate_pending_yield_internal(user, yield_pool)
         };
         
-        let usdc_value = (((rusdc_balance as u128) * exchange_rate) / yield_math::get_precision() as u64);
-        let yield_earned = if (usdc_value > rusdc_balance) {
-            usdc_value - rusdc_balance
-        } else { 0 };
+        let exchange_rate = FIXED_EXCHANGE_RATE; // Always 1:1
+        let usdc_value = rusd_balance; // 1:1 ratio with USDC
         
-        (rusdc_balance, usdc_value, yield_earned, exchange_rate)
-        // Returns: (RUSDC tokens, Current USDC value, Yield earned, Current exchange rate)
+        (rusd_balance, usdc_value, claimable_yield, exchange_rate)
+        // Returns: (RUSD tokens, Current USDC value, Claimable yield, Fixed exchange rate)
     }
 
     #[view]
-    public fun get_user_balance(user: address): u64 acquires RUSDCToken {
-        let rusdc_token = get_rusdc_token();
-        primary_fungible_store::balance(user, rusdc_token)
+    public fun get_user_balance(user: address): u64 acquires RUSDToken {
+        let rusd_token = get_rusd_token();
+        primary_fungible_store::balance(user, rusd_token)
+    }
+
+    /// Get yield pool stats
+    #[view]
+    public fun get_yield_pool_stats(): (u64, u64, u64, u64, bool) acquires YieldPool {
+        let yield_pool = borrow_global<YieldPool>(@riverfi);
+        (yield_pool.total_claimable_yield, yield_pool.total_rusd_earning, 
+         yield_pool.annual_apy_bps, yield_pool.last_yield_accrual_ts, yield_pool.auto_distribute_yield)
+    }
+    
+    /// Get user's pending claimable yield
+    #[view]
+    public fun get_pending_yield(user: address): u64 acquires YieldPool, RUSDToken {
+        let yield_pool = borrow_global<YieldPool>(@riverfi);
+        if (yield_pool.auto_distribute_yield) {
+            calculate_pending_yield_reward(user)
+        } else {
+            calculate_pending_yield_internal(user, yield_pool)
+        }
+    }
+    
+    /// Get user's pending yield rewards (for auto-distribute mode)
+    #[view]
+    public fun get_pending_yield_rewards(user: address): u64 acquires RUSDToken, YieldPool {
+        calculate_pending_yield_reward(user)
     }
 
     // -- Public Functions
-    public fun get_rusdc_token(): Object<Metadata> acquires RUSDCToken {
-        let rusdc = borrow_global<RUSDCToken>(@riverfi);
-        rusdc.token
+    public fun get_rusd_token(): Object<Metadata> acquires RUSDToken {
+        let rusd = borrow_global<RUSDToken>(@riverfi);
+        rusd.token
     }
 
     public fun get_vault_address(): address {
@@ -436,33 +699,33 @@ module riverfi::vault {
         move_to(&account_signer, Vault {
             extend_ref,
             total_usdc: 0,
-            total_rusdc_supply: 0,
-            reserve_usdc: 0,
+            total_rusd_supply: 0,
             
             // Mock Protocol Positions
             tapp_shares: 0,
             hyperion_lp_tokens: 0,
             
-            // NAV tracking
-            exchange_rate: 0,
+            // Fixed exchange rate (always 1:1)
+            exchange_rate: FIXED_EXCHANGE_RATE,
             last_harvest_ts: now_seconds(),
             
-            // Legacy fields
+            // Legacy fields (kept for compatibility)
             hyperion_usdc: 0,
             hyperion_positions: vector::empty(),
+            reserve_usdc: 0,
         });
     }
 
-    fun init_rusdc_token(sender: &signer) {
+    fun init_rusd_token(sender: &signer) {
         let constructor_ref = &object::create_sticky_object(@riverfi);
         let token_address = object::address_from_constructor_ref(constructor_ref);
 
         primary_fungible_store::create_primary_store_enabled_fungible_asset(
             constructor_ref,
             option::none(),
-            string::utf8(RUSDC_TOKEN_NAME),
-            string::utf8(RUSDC_TOKEN_SYMBOL),
-            RUSDC_TOKEN_DECIMALS,
+            string::utf8(RUSD_TOKEN_NAME),
+            string::utf8(RUSD_TOKEN_SYMBOL),
+            RUSD_TOKEN_DECIMALS,
             string::utf8(b"https://river.finance/icon.png"),
             string::utf8(b"https://river.finance")
         );
@@ -474,7 +737,7 @@ module riverfi::vault {
 
         move_to(
             sender,
-            RUSDCToken {
+            RUSDToken {
                 token: object::address_to_object(token_address),
                 mint_ref,
                 transfer_ref,
@@ -484,19 +747,252 @@ module riverfi::vault {
         );
     }
 
-    fun mint_rusdc(recipient: address, amount: u64) acquires RUSDCToken {
-        let rusdc = borrow_global<RUSDCToken>(@riverfi);
-        let fa = fungible_asset::mint(&rusdc.mint_ref, amount);
+    fun mint_rusd(recipient: address, amount: u64) acquires RUSDToken {
+        let rusd = borrow_global<RUSDToken>(@riverfi);
+        let fa = fungible_asset::mint(&rusd.mint_ref, amount);
         primary_fungible_store::deposit(recipient, fa);
     }
 
-    fun burn_rusdc(owner: address, amount: u64) acquires RUSDCToken {
-        let rusdc = borrow_global<RUSDCToken>(@riverfi);
-        primary_fungible_store::burn(&rusdc.burn_ref, owner, amount);
+    fun burn_rusd(owner: address, amount: u64) acquires RUSDToken {
+        let rusd = borrow_global<RUSDToken>(@riverfi);
+        primary_fungible_store::burn(&rusd.burn_ref, owner, amount);
     }
 
     fun get_vault_signer(vault: &Vault): signer {
         object::generate_signer_for_extending(&vault.extend_ref)
+    }
+    
+    /// Mint RUSD tokens to the yield pool
+    fun mint_rusd_to_pool(amount: u64) acquires RUSDToken, YieldPool {
+        let rusd = borrow_global<RUSDToken>(@riverfi);
+        let fa = fungible_asset::mint(&rusd.mint_ref, amount);
+        
+        // Deposit to yield pool (held by protocol)
+        primary_fungible_store::deposit(@riverfi, fa);
+        
+        // Update yield pool accounting
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        yield_pool.total_claimable_yield = yield_pool.total_claimable_yield + amount;
+    }
+    
+    /// Transfer RUSD from yield pool to user
+    fun transfer_rusd_from_pool(recipient: address, amount: u64) acquires RUSDToken, YieldPool {
+        // Transfer from protocol's balance to user
+        let rusd_token = get_rusd_token();
+        primary_fungible_store::transfer_with_ref(
+            &borrow_global<RUSDToken>(@riverfi).transfer_ref,
+            @riverfi,
+            recipient,
+            amount
+        );
+        
+        // Update yield pool accounting
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        yield_pool.total_claimable_yield = yield_pool.total_claimable_yield - amount;
+    }
+
+    /// Accrue daily yield based on APY and distribute automatically or to pool
+    fun accrue_daily_yield_internal() acquires YieldPool, RUSDToken {
+        let current_time = now_seconds();
+        let (total_earning, annual_apy_bps, last_accrual, auto_distribute) = {
+            let yield_pool = borrow_global<YieldPool>(@riverfi);
+            (yield_pool.total_rusd_earning, yield_pool.annual_apy_bps, 
+             yield_pool.last_yield_accrual_ts, yield_pool.auto_distribute_yield)
+        };
+        
+        // Check if a day has passed since last accrual
+        let time_since_last_accrual = current_time - last_accrual;
+        let days_passed = time_since_last_accrual / SECONDS_PER_DAY;
+        
+        if (days_passed == 0 || total_earning == 0) {
+            return
+        };
+        
+        // Calculate daily yield from annual APY
+        // Daily rate = Annual APY / 365 days
+        let daily_rate_bps = annual_apy_bps / (DAYS_PER_YEAR as u64);
+        let daily_yield = (total_earning * daily_rate_bps) / 10000;
+        let total_yield_to_accrue = daily_yield * days_passed;
+        
+        if (total_yield_to_accrue > 0) {
+            if (auto_distribute) {
+                // Automatically distribute yield to all token holders proportionally
+                distribute_yield_automatically(total_yield_to_accrue);
+            } else {
+                // Add to claimable pool for manual claims
+                mint_rusd_to_pool(total_yield_to_accrue);
+            };
+            
+            // Update last accrual timestamp
+            let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+            yield_pool.last_yield_accrual_ts = current_time;
+            
+            event::emit(DailyYieldAccruedEvent {
+                total_earning_rusd: total_earning,
+                daily_rate_bps: daily_rate_bps,
+                yield_accrued: total_yield_to_accrue,
+                timestamp: current_time
+            });
+        };
+    }
+    
+    /// Calculate pending yield for a user
+    fun calculate_pending_yield_internal(user: address, yield_pool: &YieldPool): u64 acquires RUSDToken {
+        // If auto-distribution is enabled, users don't need to claim manually
+        if (yield_pool.auto_distribute_yield) {
+            return 0 // Yield is automatically distributed
+        };
+        
+        if (yield_pool.total_rusd_earning == 0 || yield_pool.total_claimable_yield == 0) {
+            return 0
+        };
+        
+        // Get user's RUSD balance (their share of earning tokens)
+        let user_balance = if (exists<RUSDToken>(@riverfi)) {
+            let rusd_token = borrow_global<RUSDToken>(@riverfi);
+            primary_fungible_store::balance(user, rusd_token.token)
+        } else {
+            0
+        };
+        
+        if (user_balance == 0) {
+            return 0
+        };
+        
+        // Calculate user's share of yield pool
+        let user_yield_share = (user_balance * yield_pool.total_claimable_yield) / yield_pool.total_rusd_earning;
+        
+        // Check if user has claimed recently (only for manual claim mode)
+        if (table::contains(&yield_pool.user_last_claim_ts, user)) {
+            let last_claim_time = *table::borrow(&yield_pool.user_last_claim_ts, user);
+            let time_since_claim = now_seconds() - last_claim_time;
+            
+            // Only allow claiming once per day (86400 seconds)
+            if (time_since_claim < SECONDS_PER_DAY) {
+                return 0
+            };
+        };
+        
+        user_yield_share
+    }
+    
+    /// Automatically distribute yield to all RUSD token holders proportionally
+    /// Using a reward pool mechanism where yield is accumulated per token
+    fun distribute_yield_automatically(total_yield: u64) acquires RUSDToken, YieldPool {
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        
+        // If no one is earning, add to claimable pool instead
+        if (yield_pool.total_rusd_earning == 0) {
+            mint_rusd_to_pool(total_yield);
+            return
+        };
+        
+        // Calculate yield per token (scaled by 1e12 for precision) - use safer math
+        let yield_per_token = if (yield_pool.total_rusd_earning > 0) {
+            let total_yield_u128 = (total_yield as u128);
+            let scale_u128 = 1000000000000u128;
+            let earning_u128 = (yield_pool.total_rusd_earning as u128);
+            ((total_yield_u128 * scale_u128) / earning_u128 as u64)
+        } else {
+            0
+        };
+        yield_pool.yield_per_token_accumulated = yield_pool.yield_per_token_accumulated + yield_per_token;
+        
+        // Mint the yield tokens to the protocol balance (acts as reward pool)
+        let rusd = borrow_global<RUSDToken>(@riverfi);
+        let fa = fungible_asset::mint(&rusd.mint_ref, total_yield);
+        primary_fungible_store::deposit(@riverfi, fa);
+        
+        // Update tracking
+        yield_pool.total_yield_distributed = yield_pool.total_yield_distributed + total_yield;
+        yield_pool.last_distribution_time = now_seconds();
+        
+        // Emit distribution event
+        event::emit(YieldDistributedEvent {
+            total_amount: total_yield,
+            distributed_to_holders: true,
+            timestamp: now_seconds()
+        });
+    }
+    
+    /// Calculate pending yield reward for a user based on their balance
+    fun calculate_pending_yield_reward(user: address): u64 acquires RUSDToken, YieldPool {
+        let yield_pool = borrow_global<YieldPool>(@riverfi);
+        let user_balance = get_user_balance(user);
+        
+        if (user_balance == 0 || !yield_pool.auto_distribute_yield) {
+            return 0
+        };
+        
+        let user_yield_debt = if (table::contains(&yield_pool.user_yield_debt, user)) {
+            *table::borrow(&yield_pool.user_yield_debt, user)
+        } else {
+            0
+        };
+        
+        // Use safer math to prevent overflow: divide first, then multiply
+        // This may reduce precision slightly but prevents overflow
+        let accumulated_yield = if (yield_pool.yield_per_token_accumulated > 0) {
+            let user_balance_u128 = (user_balance as u128);
+            let yield_per_token_u128 = (yield_pool.yield_per_token_accumulated as u128);
+            let result = user_balance_u128 * yield_per_token_u128 / 1000000000000;
+            (result as u64)
+        } else {
+            0
+        };
+        
+        if (accumulated_yield > user_yield_debt) {
+            accumulated_yield - user_yield_debt
+        } else {
+            0
+        }
+    }
+    
+    /// Update user yield debt when their balance changes
+    fun update_user_yield_debt(user: address, new_balance: u64) acquires YieldPool {
+        let yield_pool = borrow_global_mut<YieldPool>(@riverfi);
+        // Use safer math to prevent overflow
+        let new_debt = if (yield_pool.yield_per_token_accumulated > 0) {
+            let new_balance_u128 = (new_balance as u128);
+            let yield_per_token_u128 = (yield_pool.yield_per_token_accumulated as u128);
+            let result = new_balance_u128 * yield_per_token_u128 / 1000000000000;
+            (result as u64)
+        } else {
+            0
+        };
+        
+        if (table::contains(&yield_pool.user_yield_debt, user)) {
+            *table::borrow_mut(&mut yield_pool.user_yield_debt, user) = new_debt;
+        } else {
+            table::add(&mut yield_pool.user_yield_debt, user, new_debt);
+        };
+    }
+    
+    /// Claim pending yield rewards for a user (for auto-distribute mode)
+    fun claim_yield_rewards(user: address) acquires RUSDToken, YieldPool {
+        let pending_yield = calculate_pending_yield_reward(user);
+        
+        if (pending_yield > 0) {
+            // Check if protocol has enough balance to cover the reward
+            let rusd_token = get_rusd_token();
+            let protocol_balance = primary_fungible_store::balance(@riverfi, rusd_token);
+            
+            if (protocol_balance >= pending_yield) {
+                // Transfer yield from protocol balance to user
+                let rusd_ref = &borrow_global<RUSDToken>(@riverfi).transfer_ref;
+                primary_fungible_store::transfer_with_ref(
+                    rusd_ref,
+                    @riverfi,
+                    user,
+                    pending_yield
+                );
+                
+                // Update user's yield debt
+                let user_balance = get_user_balance(user);
+                update_user_yield_debt(user, user_balance);
+            };
+            // If protocol doesn't have enough balance, skip claiming (no error)
+        };
     }
 
     // -- Private Functions
@@ -556,16 +1052,17 @@ module riverfi::vault {
         };
     }
     
-    fun harvest_yield_internal() acquires Vault {
+    /// Compound yields in protocols (for internal accounting)
+    fun compound_protocol_yields_internal() acquires Vault {
         let vault_addr = get_vault_address();
         let vault = borrow_global_mut<Vault>(vault_addr);
         
-        // Skip if no RUSDC supply
-        if (vault.total_rusdc_supply == 0) {
+        // Skip if no RUSD supply
+        if (vault.total_rusd_supply == 0) {
             return
         };
         
-        // Compound yields in both protocols
+        // Compound yields in both protocols (for their internal tracking)
         if (vault.tapp_shares > 0) {
             tapp_exchange::compound_yield();
         };
@@ -574,7 +1071,7 @@ module riverfi::vault {
             hyperion::compound_rewards();
         };
         
-        // Calculate current NAV
+        // Calculate current NAV for event tracking
         let tapp_value = if (vault.tapp_shares > 0) {
             tapp_exchange::get_vault_value(vault_addr)
         } else { 0 };
@@ -583,50 +1080,32 @@ module riverfi::vault {
             hyperion::get_vault_value(vault_addr)
         } else { 0 };
         
-        let total_nav = tapp_value + hyperion_value + (vault.reserve_usdc as u128);
+        let total_nav = tapp_value + hyperion_value;
         
-        // Calculate new exchange rate
-        let old_exchange_rate = vault.exchange_rate;
-        if (old_exchange_rate == 0) {
-            vault.exchange_rate = yield_math::get_precision(); // Initialize to 1.0
-        } else {
-            // New rate = total_nav / total_rusdc_supply
-            vault.exchange_rate = (total_nav * yield_math::get_precision()) / (vault.total_rusdc_supply as u128);
-        };
-        
-        let yield_earned = if (vault.exchange_rate > old_exchange_rate && old_exchange_rate > 0) {
-            // Calculate yield in USDC terms
-            let old_nav = (old_exchange_rate * (vault.total_rusdc_supply as u128)) / yield_math::get_precision();
-            total_nav - old_nav
-        } else {
-            0
-        };
-        
+        // Exchange rate remains fixed
+        vault.exchange_rate = FIXED_EXCHANGE_RATE;
         vault.last_harvest_ts = now_seconds();
         
-        // Emit harvest event
+        // Emit harvest event (without exchange rate changes)
         event::emit(HarvestEvent {
             tapp_value,
             hyperion_value,
             total_nav,
-            old_exchange_rate,
-            new_exchange_rate: vault.exchange_rate,
-            yield_earned,
+            old_exchange_rate: FIXED_EXCHANGE_RATE,
+            new_exchange_rate: FIXED_EXCHANGE_RATE,
+            yield_earned: 0, // No yield earned through exchange rate
             timestamp: now_seconds()
         });
-        
-        if (vault.exchange_rate != old_exchange_rate) {
-            event::emit(ExchangeRateUpdateEvent {
-                old_rate: old_exchange_rate,
-                new_rate: vault.exchange_rate,
-                timestamp: now_seconds()
-            });
-        };
     }
 
     // -- Test Only
     #[test_only]
     public fun init_module_for_testing(sender: &signer) {
         init_module(sender)
+    }
+    
+    #[test_only]
+    public fun get_fixed_exchange_rate(): u128 {
+        FIXED_EXCHANGE_RATE
     }
 }

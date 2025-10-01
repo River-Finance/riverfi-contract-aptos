@@ -5,11 +5,11 @@ upgrade_policy = "compatible"
 authors = []
 
 [addresses]
-riverfi = "0xefa490deb584bf7423c8fdd1b5a06c869d99bbe4608ba5edfb6ed1fc63b3294a"
-deployer = "0xefa490deb584bf7423c8fdd1b5a06c869d99bbe4608ba5edfb6ed1fc63b3294a"
+riverfi = "0x59fa73b80b51aab1f42b66c973419fccee430b3d0154794b929f740aca4689b0"
+deployer = "0x59fa73b80b51aab1f42b66c973419fccee430b3d0154794b929f740aca4689b0"
 
 [dev-addresses]
-riverfi = "0xefa490deb584bf7423c8fdd1b5a06c869d99bbe4608ba5edfb6ed1fc63b3294a"
+riverfi = "0x59fa73b80b51aab1f42b66c973419fccee430b3d0154794b929f740aca4689b0"
 deployer = "0xBB"
 
 [dependencies.AptosFramework]
